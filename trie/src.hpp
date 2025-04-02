@@ -105,8 +105,8 @@ public:
   // Create an empty trie.
   Trie() = default;
 
-  bool operator==(const Trie &other) const;
-  // by TA: if you don't need this, just comment out.
+  bool operator==(const Trie &other) const { return root_ == other.root_; };
+  //  by TA: if you don't need this, just comment out.
 
   // Get the value associated with the given key.
   // 1. If the key is not in the trie, return nullptr.
@@ -262,22 +262,54 @@ public:
   template <class T>
   auto Get(std::string_view key, size_t version = -1)
       -> std::optional<ValueGuard<T>> {
+    std::shared_lock<std::shared_mutex> r_lock(snapshots_lock_);
+    // std::lock_guard<std::mutex> lock(write_lock_);
+    if (version == -1)
+      version = snapshots_.size() - 1;
 
-      };
+    if (version >= snapshots_.size()) {
+      return std::nullopt; // 版本号无效
+    }
+
+    const T *res = snapshots_[version].Get<T>(key);
+    if (res)
+      return ValueGuard<T>(snapshots_[version], *res);
+
+    return std::nullopt;
+  };
 
   // This function will insert the key-value pair into the trie. If the key
   // already exists in the trie, it will overwrite the value return the
   // version number after operation Hint: new version should only be visible
   // after the operation is committed(completed)
-  template <class T> size_t Put(std::string_view key, T value);
+  template <class T> size_t Put(std::string_view key, T value) {
+    std::unique_lock<std::shared_mutex> u_lock(snapshots_lock_);
+    // std::lock_guard<std::mutex> w_lock(write_lock_); // 写操作互斥
+
+    snapshots_.push_back(snapshots_.back().Put<T>(key, std::move(value)));
+
+    return snapshots_.size() - 1;
+  };
 
   // This function will remove the key-value pair from the trie.
   // return the version number after operation
   // if the key does not exist, version number should not be increased
-  size_t Remove(std::string_view key);
+  size_t Remove(std::string_view key) {
+    std::unique_lock<std::shared_mutex> u_lock(snapshots_lock_);
+    // std::lock_guard<std::mutex> w_lock(write_lock_); // 写操作互斥
+
+    Trie new_trie = snapshots_.back().Remove(key);
+    if (new_trie != snapshots_.back()) { // 只有 key 存在时才增加版本
+      snapshots_.push_back(std::move(new_trie));
+    }
+    return snapshots_.size() - 1;
+  };
 
   // This function return the newest version number
-  size_t get_version();
+  size_t get_version() {
+    std::shared_lock<std::shared_mutex> lock(snapshots_lock_);
+    return snapshots_.size() - 1;
+  };
 
 private:
   // This mutex sequences all writes operations and allows only one write
