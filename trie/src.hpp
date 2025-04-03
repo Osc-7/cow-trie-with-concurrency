@@ -254,6 +254,13 @@ private:
 // This class is a thread-safe wrapper around the Trie class. It provides a
 // simple interface for accessing the trie. It should allow concurrent reads and
 // a single write operation at the same time.
+
+// Note:
+// 实际上为什么要有两个互斥量，write_mutex是为了防止Put和Remove并发，snapshot_mutex是为了防止Get方法里面
+// 出现snapshot（vector）的失效。同样的道理，在Put和Remove里面涉及到对snapshot的读和写都可以造成影响，因此要用一个
+// shared_lock进行保护。
+// 目前的认知大致如此，后续要更深入解释就要研究一下底层了。
+
 class TrieStore {
 public:
   // This function returns a ValueGuard object that holds a reference to the
@@ -262,8 +269,9 @@ public:
   template <class T>
   auto Get(std::string_view key, size_t version = -1)
       -> std::optional<ValueGuard<T>> {
-    std::shared_lock<std::shared_mutex> r_lock(snapshots_lock_);
-    // std::lock_guard<std::mutex> lock(write_lock_);
+    // std::shared_lock<std::shared_mutex> r_lock(snapshots_lock_);
+    std::shared_lock<std::shared_mutex> lock(snapshots_lock_);
+
     if (version == -1)
       version = snapshots_.size() - 1;
 
@@ -283,40 +291,55 @@ public:
   // version number after operation Hint: new version should only be visible
   // after the operation is committed(completed)
   template <class T> size_t Put(std::string_view key, T value) {
-    std::unique_lock<std::shared_mutex> u_lock(snapshots_lock_);
-    // std::lock_guard<std::mutex> w_lock(write_lock_); // 写操作互斥
+    std::lock_guard<std::mutex> w_lock(write_lock_);
 
-    snapshots_.push_back(snapshots_.back().Put<T>(key, std::move(value)));
+    Trie old_trie;
+    {
+      std::shared_lock<std::shared_mutex> read_lock(snapshots_lock_);
+      old_trie = snapshots_.back();
+    }
+    Trie new_trie = old_trie.Put(key, std::move(value));
+    {
+      std::unique_lock<std::shared_mutex> write_lock(snapshots_lock_);
+      snapshots_.push_back(std::move(new_trie));
+    }
 
-    return snapshots_.size() - 1;
+    return get_version();
   };
 
   // This function will remove the key-value pair from the trie.
   // return the version number after operation
   // if the key does not exist, version number should not be increased
   size_t Remove(std::string_view key) {
-    std::unique_lock<std::shared_mutex> u_lock(snapshots_lock_);
-    // std::lock_guard<std::mutex> w_lock(write_lock_); // 写操作互斥
+    std::lock_guard<std::mutex> w_lock(write_lock_);
 
-    Trie new_trie = snapshots_.back().Remove(key);
-    if (new_trie != snapshots_.back()) { // 只有 key 存在时才增加版本
-      snapshots_.push_back(std::move(new_trie));
+    Trie new_trie;
+
+    {
+      std::shared_lock<std::shared_mutex> read_lock(snapshots_lock_);
+      new_trie = snapshots_.back().Remove(key);
     }
-    return snapshots_.size() - 1;
+
+    {
+      std::unique_lock<std::shared_mutex> write_lock(snapshots_lock_);
+      if (new_trie != snapshots_.back()) { // 只有 key 存在时才增加版本
+        snapshots_.push_back(std::move(new_trie));
+      }
+    }
+
+    return get_version();
   };
 
   // This function return the newest version number
-  size_t get_version() {
-    std::shared_lock<std::shared_mutex> lock(snapshots_lock_);
-    return snapshots_.size() - 1;
+  size_t get_version() const {
+    return version_.load(std::memory_order_relaxed);
   };
 
 private:
-  // This mutex sequences all writes operations and allows only one write
-  // operation at a time. Concurrent modifications should have the effect of
-  // applying them in some sequential order
-  std::mutex write_lock_;
+  // 读写锁，保护 snapshots_ 的读写操作
   std::shared_mutex snapshots_lock_;
+  std::mutex write_lock_;
+  std::atomic<size_t> version_;
 
   // Stores all historical versions of trie
   // version number ranges from [0, snapshots_.size())
